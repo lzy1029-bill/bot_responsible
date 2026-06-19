@@ -172,6 +172,7 @@ git clone https://github.com/mjy1113451/bot_responsible.git astrbot_plugin_relat
 ## 📧 联系方式
 
 如有问题或建议，请通过 GitHub Issues 联系。
+作者的插件群：1079297679
 
 ---
 
