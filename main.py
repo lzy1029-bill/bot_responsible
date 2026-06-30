@@ -819,10 +819,13 @@ class RelationshipManager(Star):
         if not target_uids:
             return None
 
-        # NapCat exposes pending/suspicious friend requests through this action.
-        for action_name in ("get_doubt_friends_add_request", "get_friend_system_msg"):
+        # NapCat exposes filtered/suspicious friend requests through this action.
+        # There is no official get_friend_system_msg action in current NapCat.
+        for action_name in ("get_doubt_friends_add_request",):
             try:
-                res = await self._api(action_name, event=event, count=20)
+                res = await self._api(action_name, event=event, count=50)
+                if not res:
+                    res = await self._api(action_name, event=event)
             except Exception as e:
                 logger.warning(f"查询好友申请列表失败: action={action_name}, err={e}")
                 continue
@@ -850,9 +853,7 @@ class RelationshipManager(Star):
                         time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         notify_ids=[],
                         live_lookup=True,
-                        request_api="set_doubt_friends_add_request"
-                        if action_name == "get_doubt_friends_add_request"
-                        else "set_friend_add_request",
+                        request_api="set_doubt_friends_add_request",
                     )
                     logger.info(f"实时匹配好友申请: action={action_name}, uid={uid}, flag={flag}")
                     return flag, info
