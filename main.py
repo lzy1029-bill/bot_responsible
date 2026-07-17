@@ -11,6 +11,14 @@ from astrbot.api.event.filter import EventMessageType
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
+# 导入平台适配器类型和权限类型（用于请求/通知事件监听）
+try:
+    from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
+    from astrbot.core.star.filter.permission import PermissionType
+except ImportError:
+    PlatformAdapterType = None
+    PermissionType = None
+
 # 尝试导入 AiocqhttpMessageEvent（用于类型提示）
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -1398,22 +1406,77 @@ class RelationshipManager(Star):
 
     # ───────── 请求事件自动监听 ─────────
 
+    async def _on_request(self, event: AstrMessageEvent):
+        """
+        参考 astrbot_plugin_relationship 的 on_request 处理流程：
+        直接读取 raw_message，严格检查 post_type/request_type/sub_type。
+        群邀请时发送通知给管理员，并回复邀请人告知已收到请求。
+        """
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if not isinstance(raw, dict):
+            return
+
+        post_type = str(raw.get("post_type", "")).lower()
+        request_type = str(raw.get("request_type", "")).lower()
+        sub_type = str(raw.get("sub_type", "")).lower()
+
+        if post_type != "request":
+            return
+
+        # ── 好友申请 ──
+        if request_type == "friend":
+            logger.info("捕获好友申请事件 (on_request): keys=%s", sorted(raw.keys()))
+            reply = await self._on_friend_req(raw, event)
+            await self._send_request_reply(raw, reply, "friend")
+
+        # ── 群邀请 ──
+        elif request_type == "group" and sub_type == "invite":
+            logger.info("捕获群邀请事件 (on_request): keys=%s", sorted(raw.keys()))
+            reply = await self._on_group_invite(raw, event)
+            await self._send_request_reply(raw, reply, "group")
+
     @filter.event_message_type(EventMessageType.ALL)
     async def handle_event(self, event: AstrMessageEvent) -> Optional[AstrMessageEvent]:
+        # ── 优先使用直接 raw_message 访问（参考插件方式，更可靠）──
+        try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+            if isinstance(raw, dict):
+                post_type = str(raw.get("post_type", "")).lower()
+                request_type = str(raw.get("request_type", "")).lower()
+                sub_type = str(raw.get("sub_type", "")).lower()
+
+                if post_type == "request":
+                    if request_type == "friend":
+                        logger.info("捕获好友申请事件 (直接): keys=%s", sorted(raw.keys()))
+                        reply = await self._on_friend_req(raw, event)
+                        if reply:
+                            await self._send_request_reply(raw, reply, "friend")
+                        return None
+
+                    elif request_type == "group" and sub_type == "invite":
+                        logger.info("捕获群邀请事件 (直接): keys=%s", sorted(raw.keys()))
+                        reply = await self._on_group_invite(raw, event)
+                        if reply:
+                            await self._send_request_reply(raw, reply, "group")
+                        return None
+        except Exception as e:
+            logger.error(f"处理请求事件异常 (直接): {e}")
+
+        # ── 回退：树遍历方式兼容旧版事件结构 ──
         try:
             raw = self._extract_event_payload(event, self._looks_like_friend_request)
             if raw:
-                logger.info("捕获好友申请事件: keys=%s", sorted(raw.keys()))
+                logger.info("捕获好友申请事件 (回退): keys=%s", sorted(raw.keys()))
                 await self._on_friend_req(raw, event)
                 return None
 
             raw = self._extract_event_payload(event, self._looks_like_group_request)
             if raw and str(raw.get("sub_type", "invite")).lower() == "invite":
-                logger.info("捕获群邀请事件: keys=%s", sorted(raw.keys()))
+                logger.info("捕获群邀请事件 (回退): keys=%s", sorted(raw.keys()))
                 await self._on_group_invite(raw, event)
                 return None
         except Exception as e:
-            logger.error(f"处理请求事件异常: {e}")
+            logger.error(f"处理请求事件异常 (回退): {e}")
 
         try:
             uid = str(event.get_sender_id())
@@ -1424,6 +1487,22 @@ class RelationshipManager(Star):
 
         return event
 
+    async def _send_request_reply(self, raw: dict, reply: str, kind: str):
+        """发送请求回复给申请人/邀请人"""
+        if not reply:
+            return
+        try:
+            if kind == "friend":
+                uid = str(raw.get("user_id", ""))
+                if uid:
+                    await self._api("send_private_msg", user_id=int(uid), message=reply)
+            elif kind == "group":
+                uid = str(raw.get("user_id", ""))
+                if uid and uid != "0":
+                    await self._api("send_private_msg", user_id=int(uid), message=reply)
+        except Exception as e:
+            logger.warning(f"发送{kind}请求回复失败: {e}")
+
     async def _on_friend_req(self, raw: dict, event: AstrMessageEvent = None):
         uid = str(raw.get("user_id", ""))
         flag = str(raw.get("flag", ""))
@@ -1431,16 +1510,16 @@ class RelationshipManager(Star):
         request_id = self._new_request_id()
 
         if not uid or not flag:
-            return
+            return None
 
         if not self._valid_uid(uid):
             logger.warning(f"好友申请 uid 格式异常，已忽略: {uid}")
-            return
+            return None
 
         if self._blocked(uid, "friend"):
             await self._api("set_friend_add_request", event=event, flag=flag, approve=False)
             await self._notify(f"🚫 自动拒绝黑名单好友申请\nQQ号: {uid}")
-            return
+            return "你的好友申请已被自动拒绝，该用户已被列入黑名单。"
 
         nickname = uid
         try:
@@ -1479,6 +1558,8 @@ class RelationshipManager(Star):
         else:
             logger.warning(f"好友申请通知未获取到可匹配的消息ID: flag={flag}, uid={uid}")
 
+        return f"好友申请已收到，请等待管理员审核。昵称：{nickname}({uid})"
+
     async def _on_group_invite(self, raw: dict, event: AstrMessageEvent = None):
         """
         修复4: uid="0"（机器人主动申请加群）场景单独处理，
@@ -1491,20 +1572,20 @@ class RelationshipManager(Star):
         sub = raw.get("sub_type", "invite")
         request_id = self._new_request_id()
         if not flag:
-            return
+            return None
 
         if uid and not self._valid_uid(uid):
             logger.warning(f"群邀请 uid 格式异常，已忽略: {uid}")
-            return
+            return None
         if gid and not self._valid_gid(gid):
             logger.warning(f"群邀请 gid 格式异常，已忽略: {gid}")
-            return
+            return None
 
         # uid="0" 表示机器人主动申请加群，跳过用户黑名单校验，只走群黑名单
         if uid and uid != "0" and self._blocked(uid, "group_invite"):
             await self._api("set_group_add_request", event=event, flag=flag, approve=False, sub_type=sub)
             await self._notify(f"🚫 自动拒绝黑名单群邀请\n邀请人: {uid}\n群号: {gid}")
-            return
+            return "你的邀请已被自动拒绝，该用户已被列入黑名单。"
 
         if self._is_group_blocked(gid):
             res = await self._api("set_group_add_request", event=event, flag=flag, approve=False, sub_type=sub)
@@ -1515,7 +1596,7 @@ class RelationshipManager(Star):
                     f"🚫 自动拒绝黑名单群邀请\n群号: {gid}\n"
                     f"⚠️ 该群曾将Bot踢出，已自动拒绝邀请"
                 )
-                return
+                return "该群曾将Bot踢出，已被列入黑名单，邀请已被自动拒绝。"
 
         inviter_nickname = uid if uid != "0" else "（机器人主动申请）"
         if uid and uid != "0":
@@ -1568,6 +1649,9 @@ class RelationshipManager(Star):
             logger.info(f"群邀请通知消息ID已记录: flag={flag}, ids={msg_ids}")
         else:
             logger.warning(f"群邀请通知未获取到可匹配的消息ID: flag={flag}, gid={gid}")
+
+        # 回复邀请人（参考插件 _decide_group 的 user_reply 逻辑）
+        return f"群邀请已收到，请等待管理员审核。群：{group_name}({gid})"
 
     # ───────── 通知事件监听（被踢 / 进群）─────────
 
